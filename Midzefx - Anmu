@@ -47,6 +47,9 @@ local State = {
         FakeSprintSpeed = 26,
         _fakeHolding = false,
         ShowMobileButton = UserInputService.TouchEnabled,
+        MobileToggleMode = false,
+        _mobileToggleOn = false,
+        _sprintPress = nil,
     },
     UI = {
         ShowHubButton = true,
@@ -333,13 +336,20 @@ task.spawn(function()
 end)
 
 -- Movement logic
--- Fake hold-sprint has top priority: while held, force WalkSpeed every frame,
--- ignoring IsSprinting / server stamina. Release restores normal behaviour.
+-- Fake sprint has top priority: while held (or tap-toggled on mobile),
+-- force WalkSpeed every frame, ignoring IsSprinting / server stamina.
+-- Release (or second tap) restores normal behaviour.
+local function fakeSprintActive()
+    if not State.Movement.FakeSprintEnabled then return false end
+    if State.Movement._fakeHolding then return true end
+    if State.Movement.MobileToggleMode and State.Movement._mobileToggleOn then return true end
+    return false
+end
 local function applyMovement()
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if hum then
-        if State.Movement.FakeSprintEnabled and State.Movement._fakeHolding then
+        if fakeSprintActive() then
             if hum.WalkSpeed ~= State.Movement.FakeSprintSpeed then
                 hum.WalkSpeed = State.Movement.FakeSprintSpeed
             end
@@ -384,19 +394,23 @@ UserInputService.InputEnded:Connect(function(input)
         State.Movement._keyHolding = false
         State.Movement._fakeHolding = State.Movement._buttonHolding or false
     end
-    -- releasing touch / left-click anywhere clears button-hold too (finger slid off)
-    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
-        if State.Movement._buttonHolding then
-            State.Movement._buttonHolding = false
-            State.Movement._fakeHolding = State.Movement._keyHolding or false
-        end
+    -- Only the finger that pressed the sprint button releases it.
+    -- (Old code cleared on ANY touch end, which killed sprint when a
+    -- second finger lifted after swiping the camera.)
+    if State.Movement._sprintPress and input == State.Movement._sprintPress then
+        State.Movement._sprintPress = nil
+        State.Movement._buttonHolding = false
+        State.Movement._fakeHolding = State.Movement._keyHolding or false
     end
 end)
 
 -- (keyboard + button share _fakeHolding = _keyHolding or _buttonHolding; handlers above keep it in sync)
 
--- Mobile hold-to-sprint button (right side, right-thumb).
--- Distinct ⚡ HOLD SPRINT look so it can't be confused with the game's RUN button.
+-- Mobile sprint button (right side, right-thumb).
+-- Distinct ⚡ look so it can't be confused with the game's RUN button.
+-- Two modes: Hold (press-and-hold) or Tap (tap on/off — frees the thumb
+-- so you can swipe the camera while sprinting). Drag the button to move it
+-- out of your camera-swipe path.
 local MobileGui, MobileBtn, MobileBtnLabel
 local function getGuiParent()
     local ok, hui = pcall(function() return gethui() end)
@@ -406,20 +420,15 @@ end
 local function updateMobileBtnVisual()
     if not MobileBtn then return end
     pcall(function()
-        local holding = State.Movement._fakeHolding and State.Movement.FakeSprintEnabled
-        MobileBtn.BackgroundColor3 = holding and Color3.fromHex("#2EFF6A") or Color3.fromHex("#14141c")
-        MobileBtnLabel.TextColor3 = holding and Color3.fromHex("#0a0a0a") or Color3.fromHex("#ffffff")
-        MobileBtnLabel.Text = holding and "⚡\nSPRINTING" or "⚡\nHOLD\nSPRINT"
+        local active = fakeSprintActive()
+        MobileBtn.BackgroundColor3 = active and Color3.fromHex("#2EFF6A") or Color3.fromHex("#14141c")
+        MobileBtnLabel.TextColor3 = active and Color3.fromHex("#0a0a0a") or Color3.fromHex("#ffffff")
+        if State.Movement.MobileToggleMode then
+            MobileBtnLabel.Text = active and "⚡\nSPRINT\nON" or "⚡\nTAP\nSPRINT"
+        else
+            MobileBtnLabel.Text = active and "⚡\nSPRINTING" or "⚡\nHOLD\nSPRINT"
+        end
     end)
-end
-local function setButtonHolding(v)
-    State.Movement._buttonHolding = v
-    if v then
-        State.Movement._fakeHolding = true
-    else
-        State.Movement._fakeHolding = State.Movement._keyHolding or false
-    end
-    updateMobileBtnVisual()
 end
 local function createMobileButton()
     if MobileGui then
@@ -436,8 +445,8 @@ local function createMobileButton()
     local btn = Instance.new("TextButton")
     btn.Name = "HoldSprint"
     btn.AnchorPoint = Vector2.new(1, 0.5)
-    btn.Position = UDim2.new(1, -24, 0.62, 0)
-    btn.Size = UDim2.fromOffset(88, 88)
+    btn.Position = UDim2.new(1, -24, 0.45, 0)
+    btn.Size = UDim2.fromOffset(80, 80)
     btn.BackgroundColor3 = Color3.fromHex("#14141c")
     btn.BackgroundTransparency = 0.08
     btn.BorderSizePixel = 0
@@ -458,29 +467,79 @@ local function createMobileButton()
     label.BackgroundTransparency = 1
     label.Size = UDim2.fromScale(1, 1)
     label.Font = Enum.Font.GothamBold
-    label.TextSize = 15
+    label.TextSize = 14
     label.LineHeight = 1.05
     label.TextColor3 = Color3.fromHex("#ffffff")
     label.Text = "⚡\nHOLD\nSPRINT"
     label.Parent = btn
     MobileBtnLabel = label
-    -- Hold: press = sprint, release = stop. Works with touch + mouse (PC test).
+    -- Press tracks its OWN touch so a second finger swiping the camera
+    -- never steals or kills the sprint hold. Drag repositions instead.
+    local pressInput, pressStart, btnStart, dragged = nil, nil, nil, false
     btn.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            if State.Movement.FakeSprintEnabled then setButtonHolding(true) end
+        local t = input.UserInputType
+        if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
+        if not State.Movement.FakeSprintEnabled then return end
+        pressInput, pressStart, btnStart, dragged = input, input.Position, btn.Position, false
+        if not State.Movement.MobileToggleMode then
+            State.Movement._sprintPress = input
+            State.Movement._buttonHolding = true
+            State.Movement._fakeHolding = true
+            updateMobileBtnVisual()
         end
     end)
-    btn.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            setButtonHolding(false)
+    UserInputService.InputChanged:Connect(function(input)
+        if input ~= pressInput then return end
+        local t = input.UserInputType
+        if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseMovement then return end
+        if (input.Position - pressStart).Magnitude > 14 then
+            dragged = true
+            btn.Position = UDim2.new(
+                btnStart.X.Scale, btnStart.X.Offset + (input.Position.X - pressStart.X),
+                btnStart.Y.Scale, btnStart.Y.Offset + (input.Position.Y - pressStart.Y)
+            )
+            -- reposition drag cancels this press's sprint (tap-toggle flips nothing)
+            if State.Movement._sprintPress == pressInput then
+                State.Movement._sprintPress = nil
+                State.Movement._buttonHolding = false
+                State.Movement._fakeHolding = State.Movement._keyHolding or false
+                updateMobileBtnVisual()
+            end
         end
     end)
+    local function finishPress(input)
+        if input ~= pressInput then return end
+        pressInput = nil
+        if dragged then return end -- was a move, not a tap
+        if State.Movement.MobileToggleMode then
+            if State.Movement.FakeSprintEnabled then
+                State.Movement._mobileToggleOn = not State.Movement._mobileToggleOn
+                updateMobileBtnVisual()
+            end
+        else
+            if State.Movement._sprintPress == input then
+                State.Movement._sprintPress = nil
+                State.Movement._buttonHolding = false
+                State.Movement._fakeHolding = State.Movement._keyHolding or false
+                updateMobileBtnVisual()
+            end
+        end
+    end
+    btn.InputEnded:Connect(finishPress)
+    -- Mouse fallback for PC testing (no InputObject tracking needed there).
     btn.MouseButton1Down:Connect(function()
-        if State.Movement.FakeSprintEnabled then setButtonHolding(true) end
+        if State.Movement.FakeSprintEnabled and not State.Movement.MobileToggleMode then
+            State.Movement._buttonHolding = true
+            State.Movement._fakeHolding = true
+            updateMobileBtnVisual()
+        end
     end)
-    btn.MouseButton1Up:Connect(function() setButtonHolding(false) end)
-    btn.MouseLeave:Connect(function()
-        -- don't force-clear on hover-leave for touch; UIS.InputEnded above handles release
+    btn.MouseButton1Up:Connect(function()
+        if not State.Movement.MobileToggleMode then
+            State.Movement._buttonHolding = false
+            State.Movement._fakeHolding = State.Movement._keyHolding or false
+            updateMobileBtnVisual()
+        end
     end)
     updateMobileBtnVisual()
 end
@@ -488,6 +547,8 @@ local function destroyMobileButton()
     if MobileGui then pcall(function() MobileGui:Destroy() end) end
     MobileGui, MobileBtn, MobileBtnLabel = nil, nil, nil
     State.Movement._buttonHolding = false
+    State.Movement._sprintPress = nil
+    State.Movement._mobileToggleOn = false
 end
 -- keep button highlight in sync (holding state changes from keyboard too)
 RunService.RenderStepped:Connect(updateMobileBtnVisual)
@@ -692,7 +753,12 @@ MoveTab:Toggle({
     Value = false,
     Callback = function(v)
         State.Movement.FakeSprintEnabled = v
-        if not v then State.Movement._fakeHolding = false end
+        if not v then
+            State.Movement._fakeHolding = false
+            State.Movement._buttonHolding = false
+            State.Movement._sprintPress = nil
+            State.Movement._mobileToggleOn = false
+        end
         WindUI:Notify({ Title = "Movement", Content = v and "Fake Sprint ON — hold your key" or "Fake Sprint OFF", Duration = 2 })
     end,
 })
@@ -721,7 +787,7 @@ MoveTab:Space()
 
 MoveTab:Toggle({
     Title = "Show Mobile Sprint Button",
-    Desc = "Big ⚡ HOLD SPRINT circle on the right side for right-thumb",
+    Desc = "Big ⚡ circle on the right side for right-thumb (draggable)",
     Value = State.Movement.ShowMobileButton,
     Callback = function(v)
         State.Movement.ShowMobileButton = v
@@ -731,6 +797,20 @@ MoveTab:Toggle({
             if MobileGui then pcall(function() MobileGui.Enabled = false end) end
             State.Movement._buttonHolding = false
         end
+    end,
+})
+
+MoveTab:Toggle({
+    Title = "Mobile Tap Mode (camera-friendly)",
+    Desc = "Tap button to toggle sprint on/off — frees your thumb to swipe the camera",
+    Value = State.Movement.MobileToggleMode,
+    Callback = function(v)
+        State.Movement.MobileToggleMode = v
+        State.Movement._mobileToggleOn = false
+        State.Movement._sprintPress = nil
+        State.Movement._buttonHolding = false
+        State.Movement._fakeHolding = State.Movement._keyHolding or false
+        updateMobileBtnVisual()
     end,
 })
 
